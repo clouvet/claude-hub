@@ -17,11 +17,12 @@ const (
 
 // Session represents a Claude Code session
 type Session struct {
-	ID           string
-	ClaudeUUID   string // The .jsonl filename (will be set in Phase 2)
-	CWD          string
-	State        SessionState
-	LastActivity time.Time
+	ID              string
+	ClaudeUUID      string // The .jsonl filename
+	CWD             string
+	State           SessionState
+	LastActivity    time.Time
+	ConnectedClients int
 
 	mu sync.RWMutex
 }
@@ -55,4 +56,34 @@ func (s *Session) SetState(state SessionState) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.State = state
+}
+
+// SetClaudeUUID sets the Claude session UUID
+func (s *Session) SetClaudeUUID(uuid string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ClaudeUUID = uuid
+}
+
+// IncrementClients increments the connected client count
+func (s *Session) IncrementClients() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ConnectedClients++
+}
+
+// DecrementClients decrements the connected client count
+func (s *Session) DecrementClients() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ConnectedClients > 0 {
+		s.ConnectedClients--
+	}
+}
+
+// GetClientCount returns the number of connected clients
+func (s *Session) GetClientCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.ConnectedClients
 }

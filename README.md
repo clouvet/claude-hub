@@ -2,9 +2,13 @@
 
 WebSocket hub for multi-client Claude Code session synchronization.
 
-## Phase 1: Core Hub + Basic WebSocket (COMPLETE)
+## Phase 1: Core Hub + Basic WebSocket (✅ COMPLETE)
 
 Basic WebSocket server that accepts connections and broadcasts messages between clients.
+
+## Phase 2: Claude Process Management (✅ COMPLETE)
+
+Spawns headless Claude processes, routes messages, and broadcasts responses to all clients.
 
 ### Running
 
@@ -41,7 +45,10 @@ Web Browser → sprite-mobile:8081 → Go Hub:9090
 - WebSocket connections on port 9090
 - Multi-client broadcasting per session
 - Client registration/unregistration
-- Basic message echo (Phase 1)
+- Headless Claude process spawning
+- Message routing to Claude via stdin
+- Response streaming from Claude to all clients
+- Interrupt support (kill process mid-generation)
 
 ## Next Phases
 

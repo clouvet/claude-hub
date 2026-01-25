@@ -5,6 +5,7 @@ import (
 	"log"
 	"sync"
 
+	"claude-hub/internal/process"
 	"claude-hub/internal/session"
 
 	"github.com/gorilla/websocket"
@@ -17,6 +18,9 @@ type Hub struct {
 
 	// Clients maps session ID to set of clients
 	clients map[string]map[*Client]bool
+
+	// Process manager
+	processMgr *process.Manager
 
 	// Register requests from clients
 	register chan *Client
@@ -42,6 +46,7 @@ func NewHub() *Hub {
 	return &Hub{
 		sessions:   make(map[string]*session.Session),
 		clients:    make(map[string]map[*Client]bool),
+		processMgr: process.NewManager(),
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
 		broadcast:  make(chan *BroadcastMessage, 256),
@@ -93,18 +98,27 @@ func (h *Hub) registerClient(client *Client) {
 	h.clients[client.sessionID][client] = true
 
 	// Create session if it doesn't exist
-	if h.sessions[client.sessionID] == nil {
-		h.sessions[client.sessionID] = session.NewSession(client.sessionID)
+	sess := h.sessions[client.sessionID]
+	if sess == nil {
+		sess = session.NewSession(client.sessionID)
+		h.sessions[client.sessionID] = sess
 		log.Printf("Created new session: %s", client.sessionID)
 	}
+
+	sess.IncrementClients()
 
 	log.Printf("Client %s connected to session %s (%d clients total)",
 		client.clientID, client.sessionID, len(h.clients[client.sessionID]))
 
+	// Spawn Claude process if this is the first client and no process exists
+	if sess.GetClientCount() == 1 && sess.GetState() == session.StateIdle {
+		go h.spawnClaudeForSession(client.sessionID, sess)
+	}
+
 	// Send system message to new client
 	systemMsg := map[string]interface{}{
 		"type":      "system",
-		"message":   "Connected to Claude Hub",
+		"message":   "Connected to Claude Hub (Phase 2)",
 		"sessionId": client.sessionID,
 	}
 	if data, err := json.Marshal(systemMsg); err == nil {
@@ -126,13 +140,17 @@ func (h *Hub) unregisterClient(client *Client) {
 			delete(h.clients[client.sessionID], client)
 			close(client.send)
 
+			if sess := h.sessions[client.sessionID]; sess != nil {
+				sess.DecrementClients()
+			}
+
 			log.Printf("Client %s disconnected from session %s (%d clients remaining)",
 				client.clientID, client.sessionID, len(h.clients[client.sessionID]))
 
-			// Clean up empty session
+			// Clean up empty session (keep process running for now)
 			if len(h.clients[client.sessionID]) == 0 {
 				delete(h.clients, client.sessionID)
-				log.Printf("No more clients for session %s", client.sessionID)
+				log.Printf("No more clients for session %s (process still running)", client.sessionID)
 			}
 		}
 	}
@@ -168,52 +186,74 @@ func (h *Hub) handleClientMessage(client *Client, msg *ClientMessage) {
 
 	switch msg.Type {
 	case "user":
-		// For Phase 1, just echo the message back to all clients
-		h.echoUserMessage(client, msg)
+		h.handleUserMessage(client, msg)
 
 	case "interrupt":
-		// For Phase 1, just log it
-		log.Printf("[%s] Interrupt received (not yet implemented)", client.sessionID)
+		h.handleInterrupt(client)
 
 	default:
 		log.Printf("[%s] Unknown message type: %s", client.sessionID, msg.Type)
 	}
 }
 
-// echoUserMessage broadcasts a user message to all clients in the session
-func (h *Hub) echoUserMessage(client *Client, msg *ClientMessage) {
-	// Create a user_message broadcast
+// handleUserMessage sends a user message to Claude
+func (h *Hub) handleUserMessage(client *Client, msg *ClientMessage) {
+	// Broadcast to other clients
 	userMsg := map[string]interface{}{
 		"type": "user_message",
 		"message": map[string]interface{}{
-			"role":      "user",
-			"content":   msg.Content,
-			"timestamp": nil, // Will be populated in Phase 2
+			"role":    "user",
+			"content": msg.Content,
 		},
 	}
 
-	data, err := json.Marshal(userMsg)
-	if err != nil {
-		log.Printf("Error marshaling user message: %v", err)
-		return
-	}
-
-	// Broadcast to all clients except the sender
+	data, _ := json.Marshal(userMsg)
 	h.broadcast <- &BroadcastMessage{
 		SessionID: client.sessionID,
 		Data:      data,
 		Exclude:   client,
 	}
 
-	// Send confirmation to sender
-	confirmMsg := map[string]interface{}{
-		"type":    "system",
-		"message": "Message received (Phase 1 - echo mode)",
-	}
-	if confirmData, err := json.Marshal(confirmMsg); err == nil {
+	// Send to Claude process
+	if err := h.processMgr.SendMessage(client.sessionID, msg.Content); err != nil {
+		log.Printf("[%s] Error sending message to Claude: %v", client.sessionID, err)
+		errMsg, _ := json.Marshal(map[string]interface{}{
+			"type":    "error",
+			"message": "Failed to send message to Claude: " + err.Error(),
+		})
 		select {
-		case client.send <- confirmData:
+		case client.send <- errMsg:
 		default:
+		}
+	} else {
+		// Send processing indicator
+		processingMsg, _ := json.Marshal(map[string]interface{}{
+			"type":         "processing",
+			"isProcessing": true,
+		})
+		h.broadcast <- &BroadcastMessage{
+			SessionID: client.sessionID,
+			Data:      processingMsg,
+		}
+	}
+}
+
+// handleInterrupt interrupts the current Claude generation
+func (h *Hub) handleInterrupt(client *Client) {
+	if err := h.processMgr.Kill(client.sessionID); err != nil {
+		log.Printf("[%s] Error interrupting Claude: %v", client.sessionID, err)
+	} else {
+		resultMsg, _ := json.Marshal(map[string]interface{}{
+			"type": "result",
+		})
+		h.broadcast <- &BroadcastMessage{
+			SessionID: client.sessionID,
+			Data:      resultMsg,
+		}
+
+		// Respawn process for next message
+		if sess := h.GetSession(client.sessionID); sess != nil {
+			go h.spawnClaudeForSession(client.sessionID, sess)
 		}
 	}
 }
@@ -223,4 +263,82 @@ func (h *Hub) GetSession(sessionID string) *session.Session {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return h.sessions[sessionID]
+}
+
+// spawnClaudeForSession spawns a Claude process for a session
+func (h *Hub) spawnClaudeForSession(sessionID string, sess *session.Session) {
+	log.Printf("[%s] Spawning headless Claude process", sessionID)
+
+	hp, err := h.processMgr.Spawn(sessionID, sess.CWD, sess.ClaudeUUID)
+	if err != nil {
+		log.Printf("[%s] Failed to spawn Claude: %v", sessionID, err)
+		errMsg, _ := json.Marshal(map[string]interface{}{
+			"type":    "error",
+			"message": "Failed to start Claude process",
+		})
+		h.broadcast <- &BroadcastMessage{
+			SessionID: sessionID,
+			Data:      errMsg,
+		}
+		return
+	}
+
+	sess.SetState(session.StateWebOnly)
+
+	// Handle output from Claude
+	go h.handleClaudeOutput(sessionID, hp)
+}
+
+// handleClaudeOutput reads output from Claude and broadcasts to clients
+func (h *Hub) handleClaudeOutput(sessionID string, hp *process.HeadlessProcess) {
+	sess := h.GetSession(sessionID)
+
+	for {
+		select {
+		case msg, ok := <-hp.OutputChan:
+			if !ok {
+				// Channel closed, process terminated
+				log.Printf("[%s] Claude process output channel closed", sessionID)
+				return
+			}
+
+			// Update session with Claude UUID if this is an init message
+			if msg.Type == "system" && msg.Subtype == "init" && msg.SessionID != "" {
+				if sess != nil {
+					sess.SetClaudeUUID(msg.SessionID)
+					log.Printf("[%s] Updated Claude UUID: %s", sessionID, msg.SessionID)
+				}
+			}
+
+			// Marshal and broadcast to all clients
+			data, err := json.Marshal(msg)
+			if err != nil {
+				log.Printf("[%s] Error marshaling Claude output: %v", sessionID, err)
+				continue
+			}
+
+			h.broadcast <- &BroadcastMessage{
+				SessionID: sessionID,
+				Data:      data,
+			}
+
+		case err, ok := <-hp.ErrorChan:
+			if !ok {
+				return
+			}
+			log.Printf("[%s] Claude process error: %v", sessionID, err)
+			errMsg, _ := json.Marshal(map[string]interface{}{
+				"type":    "error",
+				"message": err.Error(),
+			})
+			h.broadcast <- &BroadcastMessage{
+				SessionID: sessionID,
+				Data:      errMsg,
+			}
+
+		case <-hp.Done():
+			log.Printf("[%s] Claude process context cancelled", sessionID)
+			return
+		}
+	}
 }
