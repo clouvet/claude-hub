@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"log"
 	"sync"
+	"time"
 
 	"claude-hub/internal/process"
 	"claude-hub/internal/session"
+	"claude-hub/internal/watcher"
 
 	"github.com/gorilla/websocket"
 )
@@ -21,6 +23,12 @@ type Hub struct {
 
 	// Process manager
 	processMgr *process.Manager
+
+	// Terminal detector
+	detector *process.TerminalDetector
+
+	// Watchers maps session ID to file watcher
+	watchers map[string]*watcher.SessionWatcher
 
 	// Register requests from clients
 	register chan *Client
@@ -43,14 +51,21 @@ type BroadcastMessage struct {
 
 // NewHub creates a new Hub
 func NewHub() *Hub {
-	return &Hub{
+	h := &Hub{
 		sessions:   make(map[string]*session.Session),
 		clients:    make(map[string]map[*Client]bool),
 		processMgr: process.NewManager(),
+		detector:   process.NewTerminalDetector(),
+		watchers:   make(map[string]*watcher.SessionWatcher),
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
 		broadcast:  make(chan *BroadcastMessage, 256),
 	}
+
+	// Start terminal detection loop
+	go h.detectTerminalLoop()
+
+	return h
 }
 
 // NewClient creates a new client
@@ -293,6 +308,12 @@ func (h *Hub) spawnClaudeForSession(sessionID string, sess *session.Session) {
 func (h *Hub) handleClaudeOutput(sessionID string, hp *process.HeadlessProcess) {
 	sess := h.GetSession(sessionID)
 
+	// Register this PID with the detector
+	if hp.Cmd != nil && hp.Cmd.Process != nil {
+		h.detector.RegisterOwnPID(hp.Cmd.Process.Pid)
+		defer h.detector.UnregisterOwnPID(hp.Cmd.Process.Pid)
+	}
+
 	for {
 		select {
 		case msg, ok := <-hp.OutputChan:
@@ -342,3 +363,200 @@ func (h *Hub) handleClaudeOutput(sessionID string, hp *process.HeadlessProcess) 
 		}
 	}
 }
+
+// detectTerminalLoop periodically scans for terminal Claude processes
+func (h *Hub) detectTerminalLoop() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		h.scanForTerminalSessions()
+	}
+}
+
+// scanForTerminalSessions scans for terminal processes and handles state transitions
+func (h *Hub) scanForTerminalSessions() {
+	processes, err := h.detector.ScanForTerminalSessions()
+	if err != nil {
+		log.Printf("Error scanning for terminal sessions: %v", err)
+		return
+	}
+
+	// Check each detected process
+	for _, proc := range processes {
+		h.handleTerminalDetected(proc.SessionID, proc.PID)
+	}
+
+	// Check for terminal processes that have exited
+	h.checkTerminalExits()
+}
+
+// handleTerminalDetected handles when a terminal Claude process is detected
+func (h *Hub) handleTerminalDetected(claudeUUID string, pid int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Find session by Claude UUID
+	var sess *session.Session
+	var sessionID string
+	for id, s := range h.sessions {
+		if s.ClaudeUUID == claudeUUID {
+			sess = s
+			sessionID = id
+			break
+		}
+	}
+
+	if sess == nil {
+		// Unknown session, ignore
+		return
+	}
+
+	// Check current state
+	currentState := sess.GetState()
+
+	if currentState == session.StateWebOnly {
+		// Terminal process detected while in web-only mode
+		// Transition: WEB_ONLY -> TRANSITIONING -> TERMINAL_ONLY
+		log.Printf("[%s] Terminal process detected (PID: %d), killing headless", sessionID, pid)
+
+		// Transition to TRANSITIONING
+		sess.TransitionTo(session.StateTransitioning)
+
+		// Kill headless process
+		if err := h.processMgr.Kill(sessionID); err != nil {
+			log.Printf("[%s] Error killing headless process: %v", sessionID, err)
+		}
+
+		// Transition to TERMINAL_ONLY
+		sess.TransitionTo(session.StateTerminalOnly)
+
+		// Start file watching
+		h.startFileWatching(sessionID, sess)
+
+		// Notify clients
+		systemMsg, _ := json.Marshal(map[string]interface{}{
+			"type":    "system",
+			"message": "Switched to terminal mode - file watching active",
+		})
+		h.broadcast <- &BroadcastMessage{
+			SessionID: sessionID,
+			Data:      systemMsg,
+		}
+	}
+}
+
+// checkTerminalExits checks if terminal processes have exited
+func (h *Hub) checkTerminalExits() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for sessionID, sess := range h.sessions {
+		if sess.GetState() != session.StateTerminalOnly {
+			continue
+		}
+
+		// Check if there's still a terminal process for this session
+		proc, _ := h.detector.FindSessionProcess(sess.ClaudeUUID)
+		if proc == nil {
+			// Terminal process exited
+			log.Printf("[%s] Terminal process exited, returning to web mode", sessionID)
+
+			// Stop file watching
+			h.stopFileWatching(sessionID)
+
+			// Transition back to WEB_ONLY
+			sess.TransitionTo(session.StateWebOnly)
+
+			// Respawn headless if there are connected clients
+			if sess.GetClientCount() > 0 {
+				go h.spawnClaudeForSession(sessionID, sess)
+
+				// Notify clients
+				systemMsg, _ := json.Marshal(map[string]interface{}{
+					"type":    "system",
+					"message": "Terminal session ended - returning to web mode",
+				})
+				h.broadcast <- &BroadcastMessage{
+					SessionID: sessionID,
+					Data:      systemMsg,
+				}
+			}
+		}
+	}
+}
+
+// startFileWatching starts watching a session file
+func (h *Hub) startFileWatching(sessionID string, sess *session.Session) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Don't start if already watching
+	if h.watchers[sessionID] != nil {
+		return
+	}
+
+	// Need Claude UUID to watch
+	if sess.ClaudeUUID == "" {
+		log.Printf("[%s] Cannot start watching: no Claude UUID", sessionID)
+		return
+	}
+
+	w, err := watcher.NewSessionWatcher(sessionID, sess.ClaudeUUID)
+	if err != nil {
+		log.Printf("[%s] Failed to create watcher: %v", sessionID, err)
+		return
+	}
+
+	h.watchers[sessionID] = w
+	w.Start()
+
+	// Handle watcher events
+	go h.handleWatcherEvents(sessionID, w)
+}
+
+// stopFileWatching stops watching a session file
+func (h *Hub) stopFileWatching(sessionID string) {
+	h.mu.Lock()
+	w := h.watchers[sessionID]
+	delete(h.watchers, sessionID)
+	h.mu.Unlock()
+
+	if w != nil {
+		w.Stop()
+		log.Printf("[%s] Stopped file watching", sessionID)
+	}
+}
+
+// handleWatcherEvents handles events from a file watcher
+func (h *Hub) handleWatcherEvents(sessionID string, w *watcher.SessionWatcher) {
+	for event := range w.Events() {
+		// Convert parsed message to broadcast format
+		broadcastMsg := map[string]interface{}{
+			"type": "user_message",
+			"message": map[string]interface{}{
+				"role":      event.Role,
+				"content":   event.Content,
+				"timestamp": event.Timestamp,
+			},
+		}
+
+		if event.Role == "assistant" {
+			// Send as content delta for assistant messages
+			broadcastMsg = map[string]interface{}{
+				"type": "content_block_delta",
+				"delta": map[string]interface{}{
+					"type": "text_delta",
+					"text": event.Content,
+				},
+			}
+		}
+
+		data, _ := json.Marshal(broadcastMsg)
+		h.broadcast <- &BroadcastMessage{
+			SessionID: sessionID,
+			Data:      data,
+		}
+	}
+}
+

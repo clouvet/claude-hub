@@ -10,6 +10,10 @@ Basic WebSocket server that accepts connections and broadcasts messages between 
 
 Spawns headless Claude processes, routes messages, and broadcasts responses to all clients.
 
+## Phase 3: File Watching + Terminal Detection (✅ COMPLETE)
+
+Detects terminal Claude sessions, kills headless processes, and tails .jsonl files to broadcast terminal messages to web clients.
+
 ### Running
 
 ```bash
@@ -49,6 +53,11 @@ Web Browser → sprite-mobile:8081 → Go Hub:9090
 - Message routing to Claude via stdin
 - Response streaming from Claude to all clients
 - Interrupt support (kill process mid-generation)
+- **File watching with fsnotify**
+- **Terminal Claude process detection via /proc scanning**
+- **State machine: WEB_ONLY ↔ TERMINAL_ONLY**
+- **Auto-kill headless when terminal detected**
+- **Tail .jsonl files and broadcast to web clients**
 
 ## Next Phases
 
