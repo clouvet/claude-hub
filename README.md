@@ -50,6 +50,23 @@ Web Browsers → sprite-mobile:8081 (WebSocket proxy)
 
 ## Installation
 
+### On a New Sprite
+
+The recommended way to install claude-hub is via the sprite setup script:
+
+```bash
+cd /home/sprite
+./sprite-setup.sh 12
+```
+
+This will:
+- Clone/update the claude-hub repository to `~/.claude-hub/`
+- Build the Go binary
+- Create the service configuration
+- Start the claude-hub service on port 9090
+
+### Manual Installation
+
 ```bash
 # Clone
 git clone https://github.com/clouvet/claude-hub.git ~/.claude-hub
@@ -58,8 +75,18 @@ cd ~/.claude-hub
 # Build
 go build -o bin/claude-hub main.go
 
-# Run
-./bin/claude-hub
+# Create service configuration
+mkdir -p ~/.sprite/services
+cat > ~/.sprite/services/claude-hub.yaml << EOF
+name: claude-hub
+port: 9090
+command: $HOME/.claude-hub/scripts/start-service.sh
+workdir: $HOME/.claude-hub
+description: WebSocket hub for multi-client Claude Code session synchronization
+EOF
+
+# Start service
+sprite-env services start claude-hub
 ```
 
 The hub listens on port 9090 (internal only - accessed via sprite-mobile proxy).
