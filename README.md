@@ -1,67 +1,162 @@
 # Claude Hub
 
-WebSocket hub for multi-client Claude Code session synchronization.
+WebSocket hub for multi-client Claude Code session synchronization. Enables seamless switching between sprite-mobile web UI and `claude --resume` terminal sessions.
 
-## Phase 1: Core Hub + Basic WebSocket (✅ COMPLETE)
+## Architecture
 
-Basic WebSocket server that accepts connections and broadcasts messages between clients.
+```
+Web Browsers → sprite-mobile:8081 (WebSocket proxy)
+                    ↓
+              claude-hub:9090 (this service)
+                    ↓
+         Claude processes + ~/.claude/projects/ session files
+```
 
-## Phase 2: Claude Process Management (✅ COMPLETE)
+## Features
 
-Spawns headless Claude processes, routes messages, and broadcasts responses to all clients.
+### ✅ Phase 1: Core Hub + Basic WebSocket
+- WebSocket server on port 9090
+- Multi-client broadcasting per session
+- Client registration/unregistration
+- Connection pooling
 
-## Phase 3: File Watching + Terminal Detection (✅ COMPLETE)
+### ✅ Phase 2: Claude Process Management
+- Spawns headless Claude processes (`claude --print --output-format stream-json`)
+- Routes user messages to Claude via stdin
+- Parses stream-json protocol responses
+- Broadcasts Claude output to all connected clients in real-time
+- Interrupt support (kill process mid-generation)
+- Auto-spawn on first client connection
 
-Detects terminal Claude sessions, kills headless processes, and tails .jsonl files to broadcast terminal messages to web clients.
+### ✅ Phase 3: File Watching + Terminal Detection
+- fsnotify watcher for Claude session files (`~/.claude/projects/-home-sprite/*.jsonl`)
+- Detects terminal Claude processes via /proc scanning
+- State machine: `IDLE → WEB_ONLY ⇄ TERMINAL_ONLY`
+- Auto-kills headless process when terminal session detected
+- Tails .jsonl files and broadcasts terminal messages to web clients
+- Auto-respawns headless when terminal exits
 
-### Running
+### 🚧 Phase 4: Message Queue + Interrupts (planned)
+- Per-session message queue (channel-based)
+- Sequential processing (one message at a time)
+- Interrupt handling (kill process mid-generation)
+- Queue persistence (survive hub restarts)
+
+### 🚧 Phase 5: Service Integration (planned)
+- Service YAML configuration
+- Startup script with env sourcing
+- Graceful shutdown (SIGTERM handling)
+- Structured logging
+- State persistence
+
+## Installation
 
 ```bash
-# Build
+# Clone
+git clone https://github.com/clouvet/claude-hub.git ~/.claude-hub
 cd ~/.claude-hub
+
+# Build
 go build -o bin/claude-hub main.go
 
 # Run
 ./bin/claude-hub
 ```
 
-The hub listens on port 9090.
+The hub listens on port 9090 (internal only - accessed via sprite-mobile proxy).
 
-### Testing with sprite-mobile
+## Usage with sprite-mobile
 
-Enable the proxy in sprite-mobile:
+Enable the WebSocket proxy in sprite-mobile:
 
 ```bash
 cd ~/.sprite-mobile
 USE_GO_HUB=true bun server.ts
 ```
 
-Then open multiple browser tabs to the same session and send messages. They should broadcast to all tabs.
+Then:
+1. Open sprite-mobile in browser
+2. Start a session and send messages (works via Go hub)
+3. Run `claude --resume <claude-session-uuid>` in terminal
+4. Hub auto-detects terminal, kills headless, starts watching file
+5. Messages from terminal appear in web UI in real-time
+6. Exit terminal - hub respawns headless process
 
-## Architecture
+## Key Components
 
+### internal/hub/
+- `hub.go` - WebSocket hub (broadcast, routing)
+- `client.go` - Client connection management
+
+### internal/process/
+- `manager.go` - Process lifecycle management
+- `headless.go` - Claude process wrapper
+- `detector.go` - Terminal process detection
+
+### internal/session/
+- `session.go` - Session state tracking
+- `state.go` - State machine (IDLE, WEB_ONLY, TERMINAL_ONLY, TRANSITIONING)
+
+### internal/watcher/
+- `watcher.go` - fsnotify file watching
+- `parser.go` - JSONL parsing and content extraction
+
+### pkg/claude/
+- `protocol.go` - stream-json protocol types
+
+## Configuration
+
+Environment variables:
+- `PORT` - WebSocket port (default: 9090)
+- `HOME` - User home directory for session file paths
+
+## Testing
+
+**Start the hub:**
+```bash
+cd ~/.claude-hub
+./bin/claude-hub
 ```
-Web Browser → sprite-mobile:8081 → Go Hub:9090
+
+**Test multi-client sync:**
+1. Open multiple browser tabs to same session
+2. Send messages from any tab
+3. Verify all tabs see messages and responses
+
+**Test terminal sync:**
+1. Start session in web UI
+2. Get Claude session UUID from logs
+3. Run `claude --resume <uuid>` in terminal
+4. Send messages in terminal
+5. Verify web UI shows terminal messages in real-time
+6. Exit terminal
+7. Verify web UI returns to web mode
+
+## Development
+
+```bash
+# Build
+go build -o bin/claude-hub main.go
+
+# Run with logs
+./bin/claude-hub 2>&1 | tee hub.log
+
+# Check for terminal processes
+ps aux | grep claude
+
+# Monitor session files
+watch -n 1 'ls -lh ~/.claude/projects/-home-sprite/*.jsonl | tail -5'
 ```
 
-## Current Features
+## Dependencies
 
-- WebSocket connections on port 9090
-- Multi-client broadcasting per session
-- Client registration/unregistration
-- Headless Claude process spawning
-- Message routing to Claude via stdin
-- Response streaming from Claude to all clients
-- Interrupt support (kill process mid-generation)
-- **File watching with fsnotify**
-- **Terminal Claude process detection via /proc scanning**
-- **State machine: WEB_ONLY ↔ TERMINAL_ONLY**
-- **Auto-kill headless when terminal detected**
-- **Tail .jsonl files and broadcast to web clients**
+- `github.com/gorilla/websocket` - WebSocket server
+- `github.com/fsnotify/fsnotify` - File watching
 
-## Next Phases
+## Related Projects
 
-- Phase 2: Claude process management
-- Phase 3: File watching + terminal detection
-- Phase 4: Message queue + interrupts
-- Phase 5: Service integration
+- [sprite-mobile](https://github.com/clouvet/sprite-mobile) - Web UI that proxies to this hub
+
+## License
+
+MIT
