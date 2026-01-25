@@ -36,18 +36,17 @@ Web Browsers → sprite-mobile:8081 (WebSocket proxy)
 - Tails .jsonl files and broadcasts terminal messages to web clients
 - Auto-respawns headless when terminal exits
 
-### 🚧 Phase 4: Message Queue + Interrupts (planned)
-- Per-session message queue (channel-based)
-- Sequential processing (one message at a time)
-- Interrupt handling (kill process mid-generation)
-- Queue persistence (survive hub restarts)
-
-### 🚧 Phase 5: Service Integration (planned)
-- Service YAML configuration
+### ✅ Phase 5: Service Integration
+- Service YAML configuration (`~/.sprite/services/claude-hub.yaml`)
 - Startup script with env sourcing
-- Graceful shutdown (SIGTERM handling)
+- Graceful shutdown (SIGTERM/SIGINT handling)
+- Health check endpoint (`/health`)
 - Structured logging
-- State persistence
+
+### 🚧 Phase 4: Message Queue + Interrupts (basic version working)
+- Basic sequential processing via headless process
+- Interrupt support (works, could be enhanced)
+- Future: Persistent queue for crash recovery
 
 ## Installation
 

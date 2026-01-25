@@ -1,8 +1,13 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"claude-hub/internal/hub"
 
@@ -61,5 +66,29 @@ func main() {
 
 	// Start server
 	server := &http.Server{Addr: ":9090"}
-	log.Fatal(server.ListenAndServe())
+
+	// Handle graceful shutdown
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		sig := <-sigChan
+		log.Printf("Received signal %v, shutting down gracefully...", sig)
+
+		// Create shutdown context with timeout
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		// Shutdown HTTP server
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("HTTP server shutdown error: %v", err)
+		}
+
+		log.Println("Claude Hub stopped")
+		os.Exit(0)
+	}()
+
+	log.Println("Claude Hub started successfully")
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
 }
