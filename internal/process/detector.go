@@ -2,6 +2,7 @@ package process
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -46,6 +47,7 @@ func (d *TerminalDetector) UnregisterOwnPID(pid int) {
 // ScanForTerminalSessions scans /proc for Claude processes
 func (d *TerminalDetector) ScanForTerminalSessions() ([]ClaudeProcess, error) {
 	var processes []ClaudeProcess
+	var claudeProcessCount int
 
 	// Read /proc directory
 	procDir, err := os.Open("/proc")
@@ -76,6 +78,8 @@ func (d *TerminalDetector) ScanForTerminalSessions() ([]ClaudeProcess, error) {
 			continue
 		}
 
+		claudeProcessCount++
+
 		// Try to extract session ID from open files
 		sessionID := d.extractSessionID(pid)
 		if sessionID != "" {
@@ -83,7 +87,14 @@ func (d *TerminalDetector) ScanForTerminalSessions() ([]ClaudeProcess, error) {
 				PID:       pid,
 				SessionID: sessionID,
 			})
+		} else {
+			// Debug: log Claude processes without session ID
+			log.Printf("Found Claude process PID %d but couldn't extract session ID", pid)
 		}
+	}
+
+	if claudeProcessCount > 0 {
+		log.Printf("Found %d Claude processes total, %d with session IDs", claudeProcessCount, len(processes))
 	}
 
 	return processes, nil
@@ -116,9 +127,11 @@ func (d *TerminalDetector) extractSessionID(pid int) string {
 	// Read all file descriptors
 	fds, err := os.ReadDir(fdDir)
 	if err != nil {
+		log.Printf("Cannot read fd dir for PID %d: %v", pid, err)
 		return ""
 	}
 
+	var foundFiles []string
 	for _, fd := range fds {
 		// Read the symlink to see what file it points to
 		linkPath := filepath.Join(fdDir, fd.Name())
@@ -127,16 +140,30 @@ func (d *TerminalDetector) extractSessionID(pid int) string {
 			continue
 		}
 
+		foundFiles = append(foundFiles, target)
+
 		// Check if it's a .jsonl file in our project directory
 		if strings.HasPrefix(target, d.projectDir) && strings.HasSuffix(target, ".jsonl") {
 			// Extract the UUID from the filename
 			base := filepath.Base(target)
 			sessionID := strings.TrimSuffix(base, ".jsonl")
+			log.Printf("PID %d has session file: %s -> UUID: %s", pid, target, sessionID)
 			return sessionID
 		}
 	}
 
+	if len(foundFiles) > 0 {
+		log.Printf("PID %d open files (none matched): %v", pid, foundFiles[:min(5, len(foundFiles))])
+	}
+
 	return ""
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // FindSessionProcess finds if there's a terminal process for a specific session

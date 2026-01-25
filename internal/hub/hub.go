@@ -1,8 +1,12 @@
 package hub
 
 import (
+	"bufio"
 	"encoding/json"
 	"log"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -10,6 +14,7 @@ import (
 	"claude-hub/internal/session"
 	"claude-hub/internal/watcher"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/gorilla/websocket"
 )
 
@@ -62,8 +67,8 @@ func NewHub() *Hub {
 		broadcast:  make(chan *BroadcastMessage, 256),
 	}
 
-	// Start terminal detection loop
-	go h.detectTerminalLoop()
+	// Start watching the Claude projects directory for file changes
+	go h.watchProjectsDirectory()
 
 	return h
 }
@@ -125,6 +130,11 @@ func (h *Hub) registerClient(client *Client) {
 	log.Printf("Client %s connected to session %s (%d clients total)",
 		client.clientID, client.sessionID, len(h.clients[client.sessionID]))
 
+	// Send history if we have a Claude UUID
+	if sess.ClaudeUUID != "" {
+		go h.sendHistoryToClient(client, sess.ClaudeUUID)
+	}
+
 	// Spawn Claude process if this is the first client and no process exists
 	if sess.GetClientCount() == 1 && sess.GetState() == session.StateIdle {
 		go h.spawnClaudeForSession(client.sessionID, sess)
@@ -133,7 +143,7 @@ func (h *Hub) registerClient(client *Client) {
 	// Send system message to new client
 	systemMsg := map[string]interface{}{
 		"type":      "system",
-		"message":   "Connected to Claude Hub (Phase 2)",
+		"message":   "Connected to Claude Hub (Phase 3)",
 		"sessionId": client.sessionID,
 	}
 	if data, err := json.Marshal(systemMsg); err == nil {
@@ -229,47 +239,73 @@ func (h *Hub) handleUserMessage(client *Client, msg *ClientMessage) {
 		Exclude:   client,
 	}
 
+	// Check if we need to spawn a process first
+	sess := h.GetSession(client.sessionID)
+	if sess != nil && sess.GetState() == session.StateIdle {
+		log.Printf("[%s] No process running, spawning before sending message", client.sessionID)
+		h.spawnClaudeForSession(client.sessionID, sess)
+		// Wait a bit for process to start
+		time.Sleep(500 * time.Millisecond)
+	}
+
 	// Send to Claude process
 	if err := h.processMgr.SendMessage(client.sessionID, msg.Content); err != nil {
 		log.Printf("[%s] Error sending message to Claude: %v", client.sessionID, err)
-		errMsg, _ := json.Marshal(map[string]interface{}{
-			"type":    "error",
-			"message": "Failed to send message to Claude: " + err.Error(),
-		})
-		select {
-		case client.send <- errMsg:
-		default:
+
+		// Try spawning if no process exists
+		if sess != nil {
+			log.Printf("[%s] Attempting to spawn process and retry", client.sessionID)
+			h.spawnClaudeForSession(client.sessionID, sess)
+			time.Sleep(500 * time.Millisecond)
+
+			// Retry send
+			if err := h.processMgr.SendMessage(client.sessionID, msg.Content); err != nil {
+				log.Printf("[%s] Retry failed: %v", client.sessionID, err)
+				errMsg, _ := json.Marshal(map[string]interface{}{
+					"type":    "error",
+					"message": "Failed to send message to Claude: " + err.Error(),
+				})
+				select {
+				case client.send <- errMsg:
+				default:
+				}
+				return
+			}
 		}
-	} else {
-		// Send processing indicator
-		processingMsg, _ := json.Marshal(map[string]interface{}{
-			"type":         "processing",
-			"isProcessing": true,
-		})
-		h.broadcast <- &BroadcastMessage{
-			SessionID: client.sessionID,
-			Data:      processingMsg,
-		}
+	}
+
+	// Send processing indicator
+	processingMsg, _ := json.Marshal(map[string]interface{}{
+		"type":         "processing",
+		"isProcessing": true,
+	})
+	h.broadcast <- &BroadcastMessage{
+		SessionID: client.sessionID,
+		Data:      processingMsg,
 	}
 }
 
 // handleInterrupt interrupts the current Claude generation
 func (h *Hub) handleInterrupt(client *Client) {
+	log.Printf("[%s] Interrupt received", client.sessionID)
+
 	if err := h.processMgr.Kill(client.sessionID); err != nil {
 		log.Printf("[%s] Error interrupting Claude: %v", client.sessionID, err)
-	} else {
-		resultMsg, _ := json.Marshal(map[string]interface{}{
-			"type": "result",
-		})
-		h.broadcast <- &BroadcastMessage{
-			SessionID: client.sessionID,
-			Data:      resultMsg,
-		}
+	}
 
-		// Respawn process for next message
-		if sess := h.GetSession(client.sessionID); sess != nil {
-			go h.spawnClaudeForSession(client.sessionID, sess)
-		}
+	// Send result to indicate processing stopped
+	resultMsg, _ := json.Marshal(map[string]interface{}{
+		"type": "result",
+	})
+	h.broadcast <- &BroadcastMessage{
+		SessionID: client.sessionID,
+		Data:      resultMsg,
+	}
+
+	// Respawn process immediately
+	if sess := h.GetSession(client.sessionID); sess != nil {
+		log.Printf("[%s] Respawning process after interrupt", client.sessionID)
+		go h.spawnClaudeForSession(client.sessionID, sess)
 	}
 }
 
@@ -283,6 +319,9 @@ func (h *Hub) GetSession(sessionID string) *session.Session {
 // spawnClaudeForSession spawns a Claude process for a session
 func (h *Hub) spawnClaudeForSession(sessionID string, sess *session.Session) {
 	log.Printf("[%s] Spawning headless Claude process", sessionID)
+
+	// Stop file watcher if it's running (transitioning from TERMINAL_ONLY → WEB_ONLY)
+	h.stopFileWatching(sessionID)
 
 	hp, err := h.processMgr.Spawn(sessionID, sess.CWD, sess.ClaudeUUID)
 	if err != nil {
@@ -364,14 +403,162 @@ func (h *Hub) handleClaudeOutput(sessionID string, hp *process.HeadlessProcess) 
 	}
 }
 
-// detectTerminalLoop periodically scans for terminal Claude processes
-func (h *Hub) detectTerminalLoop() {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		h.scanForTerminalSessions()
+// watchProjectsDirectory watches the Claude projects directory for file changes
+func (h *Hub) watchProjectsDirectory() {
+	homeDir := os.Getenv("HOME")
+	if homeDir == "" {
+		homeDir = "/home/sprite"
 	}
+	projectDir := filepath.Join(homeDir, ".claude", "projects", "-home-sprite")
+
+	// Create fsnotify watcher for the directory
+	dirWatcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Printf("Failed to create directory watcher: %v", err)
+		return
+	}
+	defer dirWatcher.Close()
+
+	if err := dirWatcher.Add(projectDir); err != nil {
+		log.Printf("Failed to watch projects directory: %v", err)
+		return
+	}
+
+	log.Printf("Watching projects directory: %s", projectDir)
+
+	for {
+		select {
+		case event, ok := <-dirWatcher.Events:
+			if !ok {
+				return
+			}
+
+			// Only care about write events to .jsonl files
+			if event.Op&fsnotify.Write == fsnotify.Write && strings.HasSuffix(event.Name, ".jsonl") {
+				h.handleProjectFileChange(event.Name)
+			}
+
+		case err, ok := <-dirWatcher.Errors:
+			if !ok {
+				return
+			}
+			log.Printf("Directory watcher error: %v", err)
+		}
+	}
+}
+
+// handleProjectFileChange handles when a .jsonl file in the projects directory changes
+func (h *Hub) handleProjectFileChange(filePath string) {
+	// Extract Claude UUID from filename
+	base := filepath.Base(filePath)
+	claudeUUID := strings.TrimSuffix(base, ".jsonl")
+
+	log.Printf("File changed: %s (UUID: %s)", base, claudeUUID)
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Find session by Claude UUID
+	var sess *session.Session
+	var sessionID string
+	for id, s := range h.sessions {
+		if s.ClaudeUUID == claudeUUID {
+			sess = s
+			sessionID = id
+			break
+		}
+	}
+
+	if sess == nil {
+		// No session tracking this UUID, ignore
+		log.Printf("  -> No session tracking UUID %s", claudeUUID)
+		return
+	}
+
+	log.Printf("  -> Found session %s (state: %s)", sessionID, sess.GetState().String())
+
+	// Check if we have a headless process for this session
+	hp, err := h.processMgr.Get(sessionID)
+	hasHeadlessProcess := (err == nil)
+
+	log.Printf("  -> Has headless process: %v", hasHeadlessProcess)
+
+	currentState := sess.GetState()
+
+	// If we're in WEB_ONLY mode with a headless process, check if it's generating
+	// If not generating and file changes, it's probably terminal activity
+	if currentState == session.StateWebOnly && hasHeadlessProcess {
+		if !hp.IsGenerating {
+			log.Printf("[%s] File changed while headless not generating - terminal session likely", sessionID)
+
+			// Kill headless process
+			h.processMgr.Kill(sessionID)
+
+			// Transition to terminal mode
+			sess.TransitionTo(session.StateTerminalOnly)
+
+			// Start file watching
+			if h.watchers[sessionID] == nil {
+				h.startFileWatchingUnlocked(sessionID, sess)
+			}
+
+			// Notify clients
+			systemMsg, _ := json.Marshal(map[string]interface{}{
+				"type":    "system",
+				"message": "Terminal session detected - file watching active",
+			})
+			h.broadcast <- &BroadcastMessage{
+				SessionID: sessionID,
+				Data:      systemMsg,
+			}
+		}
+	} else if !hasHeadlessProcess && currentState != session.StateTerminalOnly {
+		log.Printf("[%s] File changed without headless process - terminal session detected", sessionID)
+
+		// Transition to terminal mode
+		sess.TransitionTo(session.StateTerminalOnly)
+
+		// Start file watching
+		if h.watchers[sessionID] == nil {
+			h.startFileWatchingUnlocked(sessionID, sess)
+		}
+
+		// Notify clients
+		systemMsg, _ := json.Marshal(map[string]interface{}{
+			"type":    "system",
+			"message": "Terminal session detected - file watching active",
+		})
+		h.broadcast <- &BroadcastMessage{
+			SessionID: sessionID,
+			Data:      systemMsg,
+		}
+	}
+}
+
+// startFileWatchingUnlocked starts watching without taking the lock (caller must hold lock)
+func (h *Hub) startFileWatchingUnlocked(sessionID string, sess *session.Session) {
+	// Don't start if already watching
+	if h.watchers[sessionID] != nil {
+		return
+	}
+
+	// Need Claude UUID to watch
+	if sess.ClaudeUUID == "" {
+		log.Printf("[%s] Cannot start watching: no Claude UUID", sessionID)
+		return
+	}
+
+	w, err := watcher.NewSessionWatcher(sessionID, sess.ClaudeUUID)
+	if err != nil {
+		log.Printf("[%s] Failed to create watcher: %v", sessionID, err)
+		return
+	}
+
+	h.watchers[sessionID] = w
+	w.Start()
+
+	// Handle watcher events (unlock first to avoid deadlock)
+	go h.handleWatcherEvents(sessionID, w)
 }
 
 // scanForTerminalSessions scans for terminal processes and handles state transitions
@@ -380,6 +567,14 @@ func (h *Hub) scanForTerminalSessions() {
 	if err != nil {
 		log.Printf("Error scanning for terminal sessions: %v", err)
 		return
+	}
+
+	// Debug: log detected processes
+	if len(processes) > 0 {
+		log.Printf("Detected %d terminal Claude processes", len(processes))
+		for _, proc := range processes {
+			log.Printf("  - PID %d, Session: %s", proc.PID, proc.SessionID)
+		}
 	}
 
 	// Check each detected process
@@ -396,6 +591,14 @@ func (h *Hub) handleTerminalDetected(claudeUUID string, pid int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	log.Printf("Attempting to match terminal session UUID: %s", claudeUUID)
+
+	// Debug: show all known sessions
+	for id, s := range h.sessions {
+		log.Printf("  Known session %s -> Claude UUID: %s (state: %s)",
+			id, s.ClaudeUUID, s.GetState().String())
+	}
+
 	// Find session by Claude UUID
 	var sess *session.Session
 	var sessionID string
@@ -409,6 +612,7 @@ func (h *Hub) handleTerminalDetected(claudeUUID string, pid int) {
 
 	if sess == nil {
 		// Unknown session, ignore
+		log.Printf("No matching session found for Claude UUID: %s", claudeUUID)
 		return
 	}
 
@@ -531,31 +735,117 @@ func (h *Hub) stopFileWatching(sessionID string) {
 // handleWatcherEvents handles events from a file watcher
 func (h *Hub) handleWatcherEvents(sessionID string, w *watcher.SessionWatcher) {
 	for event := range w.Events() {
-		// Convert parsed message to broadcast format
-		broadcastMsg := map[string]interface{}{
-			"type": "user_message",
-			"message": map[string]interface{}{
-				"role":      event.Role,
-				"content":   event.Content,
-				"timestamp": event.Timestamp,
-			},
-		}
-
-		if event.Role == "assistant" {
-			// Send as content delta for assistant messages
-			broadcastMsg = map[string]interface{}{
-				"type": "content_block_delta",
-				"delta": map[string]interface{}{
-					"type": "text_delta",
-					"text": event.Content,
+		if event.Role == "user" {
+			// Send user message
+			userMsg := map[string]interface{}{
+				"type": "user_message",
+				"message": map[string]interface{}{
+					"role":      "user",
+					"content":   event.Content,
+					"timestamp": event.Timestamp.Unix() * 1000,
 				},
 			}
+			data, _ := json.Marshal(userMsg)
+			h.broadcast <- &BroadcastMessage{
+				SessionID: sessionID,
+				Data:      data,
+			}
+		} else if event.Role == "assistant" {
+			// For assistant messages from file, send as complete message with result
+			// This simulates what sprite-mobile does when saving messages
+			assistantMsg := map[string]interface{}{
+				"type": "assistant",
+				"message": map[string]interface{}{
+					"role":      "assistant",
+					"content":   event.Content,
+					"timestamp": event.Timestamp.Unix() * 1000,
+				},
+			}
+			assistantData, _ := json.Marshal(assistantMsg)
+			h.broadcast <- &BroadcastMessage{
+				SessionID: sessionID,
+				Data:      assistantData,
+			}
+
+			// Send result to mark completion
+			resultMsg := map[string]interface{}{
+				"type": "result",
+			}
+			resultData, _ := json.Marshal(resultMsg)
+			h.broadcast <- &BroadcastMessage{
+				SessionID: sessionID,
+				Data:      resultData,
+			}
+		}
+	}
+}
+
+// sendHistoryToClient sends message history from .jsonl file to a client
+func (h *Hub) sendHistoryToClient(client *Client, claudeUUID string) {
+	// Use watcher to parse the file
+	w, err := watcher.NewSessionWatcher(client.sessionID, claudeUUID)
+	if err != nil {
+		log.Printf("[%s] Failed to load history: %v", client.sessionID, err)
+		return
+	}
+
+	// Read the entire file from the beginning
+	w.Offset = 0
+
+	// Manually trigger a read to get all messages
+	// We'll create a temporary slice to collect messages
+	messages := []map[string]interface{}{}
+
+	// This is a simplified version - just read and parse the whole file
+	homeDir := os.Getenv("HOME")
+	if homeDir == "" {
+		homeDir = "/home/sprite"
+	}
+	filePath := filepath.Join(homeDir, ".claude", "projects", "-home-sprite", claudeUUID+".jsonl")
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		log.Printf("[%s] Could not open session file for history: %v", client.sessionID, err)
+		return
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
 		}
 
-		data, _ := json.Marshal(broadcastMsg)
-		h.broadcast <- &BroadcastMessage{
-			SessionID: sessionID,
-			Data:      data,
+		msg, err := watcher.ParseJSONLLine(line)
+		if err != nil {
+			continue
+		}
+
+		parsed, err := watcher.ExtractContent(msg)
+		if err != nil || parsed == nil {
+			continue
+		}
+
+		messages = append(messages, map[string]interface{}{
+			"role":      parsed.Role,
+			"content":   parsed.Content,
+			"timestamp": parsed.Timestamp.Unix() * 1000, // ms
+		})
+	}
+
+	if len(messages) > 0 {
+		historyMsg := map[string]interface{}{
+			"type":     "history",
+			"messages": messages,
+		}
+
+		data, _ := json.Marshal(historyMsg)
+		select {
+		case client.send <- data:
+			log.Printf("[%s] Sent %d messages from history to client", client.sessionID, len(messages))
+		default:
+			log.Printf("[%s] Failed to send history - client send buffer full", client.sessionID)
 		}
 	}
 }

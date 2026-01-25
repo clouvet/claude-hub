@@ -51,12 +51,13 @@ func (s *Session) TransitionTo(newState SessionState) error {
 func (s *Session) isValidTransition(from, to SessionState) bool {
 	// Define valid transitions
 	validTransitions := map[StateTransition]bool{
-		{StateIdle, StateWebOnly}:           true,
-		{StateWebOnly, StateTransitioning}:  true,
+		{StateIdle, StateWebOnly}:               true,
+		{StateWebOnly, StateTransitioning}:      true,
+		{StateWebOnly, StateTerminalOnly}:       true, // Direct transition allowed
 		{StateTransitioning, StateTerminalOnly}: true,
-		{StateTerminalOnly, StateWebOnly}:   true,
-		{StateWebOnly, StateIdle}:           true,
-		{StateTerminalOnly, StateIdle}:      true,
+		{StateTerminalOnly, StateWebOnly}:       true,
+		{StateWebOnly, StateIdle}:               true,
+		{StateTerminalOnly, StateIdle}:          true,
 	}
 
 	return validTransitions[StateTransition{from, to}]

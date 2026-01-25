@@ -106,8 +106,34 @@ func ExtractContent(msg *ClaudeMessage) (*ParsedMessage, error) {
 
 	// Only return if we have content
 	if parsed.Content != "" {
+		// Filter out internal Claude Code command messages
+		if shouldSkipMessage(parsed.Content) {
+			return nil, nil
+		}
 		return parsed, nil
 	}
 
 	return nil, nil
+}
+
+// shouldSkipMessage checks if a message contains internal Claude metadata
+func shouldSkipMessage(content string) bool {
+	// Skip messages with internal Claude Code markers
+	markers := []string{
+		"<local-command-caveat>",
+		"<command-name>",
+		"<command-message>",
+		"<command-args>",
+		"<local-command-stdout>",
+		"<local-command-stderr>",
+		"<system-reminder>",
+	}
+
+	for _, marker := range markers {
+		if len(content) >= len(marker) && content[:len(marker)] == marker {
+			return true
+		}
+	}
+
+	return false
 }
