@@ -453,8 +453,6 @@ func (h *Hub) handleProjectFileChange(filePath string) {
 	base := filepath.Base(filePath)
 	claudeUUID := strings.TrimSuffix(base, ".jsonl")
 
-	log.Printf("File changed: %s (UUID: %s)", base, claudeUUID)
-
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -470,12 +468,11 @@ func (h *Hub) handleProjectFileChange(filePath string) {
 	}
 
 	if sess == nil {
-		// No session tracking this UUID, ignore
-		log.Printf("  -> No session tracking UUID %s", claudeUUID)
+		// No session tracking this UUID, ignore silently
 		return
 	}
 
-	log.Printf("  -> Found session %s (state: %s)", sessionID, sess.GetState().String())
+	log.Printf("File changed: %s -> session %s (state: %s)", base, sessionID, sess.GetState().String())
 
 	// Check if we have a headless process for this session
 	hp, err := h.processMgr.Get(sessionID)
