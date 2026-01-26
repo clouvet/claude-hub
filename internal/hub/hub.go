@@ -872,3 +872,30 @@ func (h *Hub) sendHistoryToClient(client *Client, claudeUUID string) {
 	}
 }
 
+// GetHealthStatus returns health status including active generation info
+func (h *Hub) GetHealthStatus() []byte {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	activeGenerating := h.processMgr.GetActiveGeneratingCount()
+	totalProcesses := h.processMgr.GetProcessCount()
+	totalSessions := len(h.sessions)
+	activeConnections := 0
+
+	for _, clients := range h.clients {
+		activeConnections += len(clients)
+	}
+
+	status := map[string]interface{}{
+		"status":              "ok",
+		"active_sessions":     totalSessions,
+		"active_processes":    totalProcesses,
+		"generating":          activeGenerating,
+		"active_connections":  activeConnections,
+		"keep_sprite_awake":   activeGenerating > 0,
+	}
+
+	data, _ := json.Marshal(status)
+	return data
+}
+

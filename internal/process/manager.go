@@ -91,3 +91,24 @@ func (m *Manager) SendMessage(sessionID string, content interface{}) error {
 
 	return hp.SendMessage(content)
 }
+
+// GetActiveGeneratingCount returns the number of processes currently generating
+func (m *Manager) GetActiveGeneratingCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	count := 0
+	for _, hp := range m.processes {
+		if hp.IsGenerating {
+			count++
+		}
+	}
+	return count
+}
+
+// GetProcessCount returns the total number of processes
+func (m *Manager) GetProcessCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.processes)
+}
