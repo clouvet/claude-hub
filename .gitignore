@@ -1,0 +1,13 @@
+# Binaries
+bin/
+claude-hub
+
+# State files
+state.json
+data/
+
+# Logs
+*.log
+
+# Go
+go.sum
