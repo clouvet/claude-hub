@@ -323,7 +323,15 @@ func (h *Hub) spawnClaudeForSession(sessionID string, sess *session.Session) {
 	// Stop file watcher if it's running (transitioning from TERMINAL_ONLY → WEB_ONLY)
 	h.stopFileWatching(sessionID)
 
-	hp, err := h.processMgr.Spawn(sessionID, sess.CWD, sess.ClaudeUUID)
+	// Use sessionID as Claude UUID if not already set
+	// This ensures sprite-mobile session ID matches Claude session UUID
+	claudeUUID := sess.ClaudeUUID
+	if claudeUUID == "" {
+		claudeUUID = sessionID
+		sess.SetClaudeUUID(sessionID)
+	}
+
+	hp, err := h.processMgr.Spawn(sessionID, sess.CWD, claudeUUID)
 	if err != nil {
 		log.Printf("[%s] Failed to spawn Claude: %v", sessionID, err)
 		errMsg, _ := json.Marshal(map[string]interface{}{
