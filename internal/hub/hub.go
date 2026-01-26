@@ -35,6 +35,9 @@ type Hub struct {
 	// Watchers maps session ID to file watcher
 	watchers map[string]*watcher.SessionWatcher
 
+	// Claude projects directory path
+	claudeProjectsDir string
+
 	// Register requests from clients
 	register chan *Client
 
@@ -56,15 +59,23 @@ type BroadcastMessage struct {
 
 // NewHub creates a new Hub
 func NewHub() *Hub {
+	// Determine Claude projects directory
+	homeDir := os.Getenv("HOME")
+	if homeDir == "" {
+		homeDir = "/home/sprite"
+	}
+	claudeProjectsDir := filepath.Join(homeDir, ".claude", "projects", "-home-sprite")
+
 	h := &Hub{
-		sessions:   make(map[string]*session.Session),
-		clients:    make(map[string]map[*Client]bool),
-		processMgr: process.NewManager(),
-		detector:   process.NewTerminalDetector(),
-		watchers:   make(map[string]*watcher.SessionWatcher),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
-		broadcast:  make(chan *BroadcastMessage, 256),
+		sessions:          make(map[string]*session.Session),
+		clients:           make(map[string]map[*Client]bool),
+		processMgr:        process.NewManager(),
+		detector:          process.NewTerminalDetector(),
+		watchers:          make(map[string]*watcher.SessionWatcher),
+		claudeProjectsDir: claudeProjectsDir,
+		register:          make(chan *Client),
+		unregister:        make(chan *Client),
+		broadcast:         make(chan *BroadcastMessage, 256),
 	}
 
 	// Start watching the Claude projects directory for file changes
@@ -121,8 +132,20 @@ func (h *Hub) registerClient(client *Client) {
 	sess := h.sessions[client.sessionID]
 	if sess == nil {
 		sess = session.NewSession(client.sessionID)
+
+		// Check if a Claude session file exists for this session ID
+		// This handles the case where the user refreshed and the session was
+		// synced to Claude's UUID, but claude-hub restarted or lost the session from memory
+		claudeSessionFile := filepath.Join(h.claudeProjectsDir, client.sessionID+".jsonl")
+		if _, err := os.Stat(claudeSessionFile); err == nil {
+			// File exists! This is a resume scenario
+			log.Printf("Created new session: %s (found existing Claude session file, will resume)", client.sessionID)
+			sess.SetClaudeUUID(client.sessionID)
+		} else {
+			log.Printf("Created new session: %s", client.sessionID)
+		}
+
 		h.sessions[client.sessionID] = sess
-		log.Printf("Created new session: %s", client.sessionID)
 	}
 
 	sess.IncrementClients()
