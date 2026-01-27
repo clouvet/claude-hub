@@ -246,13 +246,24 @@ func (h *Hub) handleClientMessage(client *Client, msg *ClientMessage) {
 
 // handleUserMessage sends a user message to Claude
 func (h *Hub) handleUserMessage(client *Client, msg *ClientMessage) {
-	// Broadcast to other clients
+	// Broadcast to other clients (include all fields including image data)
+	messageContent := map[string]interface{}{
+		"role":    "user",
+		"content": msg.Content,
+	}
+
+	// Include image fields if present
+	if msg.ImageID != "" {
+		messageContent["image"] = map[string]interface{}{
+			"id":        msg.ImageID,
+			"filename":  msg.ImageFilename,
+			"mediaType": msg.ImageMediaType,
+		}
+	}
+
 	userMsg := map[string]interface{}{
-		"type": "user_message",
-		"message": map[string]interface{}{
-			"role":    "user",
-			"content": msg.Content,
-		},
+		"type":    "user_message",
+		"message": messageContent,
 	}
 
 	data, _ := json.Marshal(userMsg)
