@@ -153,9 +153,15 @@ func (h *Hub) registerClient(client *Client) {
 	log.Printf("Client %s connected to session %s (%d clients total)",
 		client.clientID, client.sessionID, len(h.clients[client.sessionID]))
 
+	// Check if Claude is currently generating
+	isGenerating := false
+	if hp, err := h.processMgr.Get(client.sessionID); err == nil {
+		isGenerating = hp.IsGenerating
+	}
+
 	// Send history if we have a Claude UUID
 	if sess.ClaudeUUID != "" {
-		go h.sendHistoryToClient(client, sess.ClaudeUUID)
+		go h.sendHistoryToClient(client, sess.ClaudeUUID, isGenerating)
 	}
 
 	// Spawn Claude process if this is the first client and no process exists
@@ -175,6 +181,21 @@ func (h *Hub) registerClient(client *Client) {
 		default:
 			close(client.send)
 			delete(h.clients[client.sessionID], client)
+		}
+	}
+
+	// If Claude is generating, send processing indicator to new client
+	// This ensures they know to expect streaming content
+	if isGenerating {
+		processingMsg := map[string]interface{}{
+			"type":         "processing",
+			"isProcessing": true,
+		}
+		if data, err := json.Marshal(processingMsg); err == nil {
+			select {
+			case client.send <- data:
+			default:
+			}
 		}
 	}
 }
@@ -814,7 +835,7 @@ func (h *Hub) handleWatcherEvents(sessionID string, w *watcher.SessionWatcher) {
 }
 
 // sendHistoryToClient sends message history from .jsonl file to a client
-func (h *Hub) sendHistoryToClient(client *Client, claudeUUID string) {
+func (h *Hub) sendHistoryToClient(client *Client, claudeUUID string, isGenerating bool) {
 	// Use watcher to parse the file
 	w, err := watcher.NewSessionWatcher(client.sessionID, claudeUUID)
 	if err != nil {
@@ -869,16 +890,30 @@ func (h *Hub) sendHistoryToClient(client *Client, claudeUUID string) {
 
 	if len(messages) > 0 {
 		historyMsg := map[string]interface{}{
-			"type":     "history",
-			"messages": messages,
+			"type":         "history",
+			"messages":     messages,
+			"isGenerating": isGenerating, // Include generation state
 		}
 
 		data, _ := json.Marshal(historyMsg)
 		select {
 		case client.send <- data:
-			log.Printf("[%s] Sent %d messages from history to client", client.sessionID, len(messages))
+			log.Printf("[%s] Sent %d messages from history to client (generating: %v)", client.sessionID, len(messages), isGenerating)
 		default:
 			log.Printf("[%s] Failed to send history - client send buffer full", client.sessionID)
+		}
+	} else if isGenerating {
+		// Even if no history, send a message indicating generation is in progress
+		historyMsg := map[string]interface{}{
+			"type":         "history",
+			"messages":     []map[string]interface{}{},
+			"isGenerating": true,
+		}
+		data, _ := json.Marshal(historyMsg)
+		select {
+		case client.send <- data:
+			log.Printf("[%s] Sent empty history with generating=true", client.sessionID)
+		default:
 		}
 	}
 }
