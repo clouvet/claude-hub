@@ -427,6 +427,22 @@ func (h *Hub) handleClaudeOutput(sessionID string, hp *process.HeadlessProcess) 
 				}
 			}
 
+			// Track streaming state
+			if sess != nil {
+				switch msg.Type {
+				case "content_block_start":
+					// Add this content block to streaming state
+					if blockData, err := json.Marshal(msg); err == nil {
+						sess.AddContentBlock(json.RawMessage(blockData))
+						sess.SetGenerating(true)
+					}
+				case "message_stop", "result":
+					// Clear streaming state when generation completes
+					sess.ClearContentBlocks()
+					sess.SetGenerating(false)
+				}
+			}
+
 			// Marshal and broadcast to all clients
 			data, err := json.Marshal(msg)
 			if err != nil {
@@ -914,6 +930,25 @@ func (h *Hub) sendHistoryToClient(client *Client, claudeUUID string, isGeneratin
 		case client.send <- data:
 			log.Printf("[%s] Sent empty history with generating=true", client.sessionID)
 		default:
+		}
+	}
+
+	// Send active content blocks if Claude is currently generating
+	// This allows reconnecting clients to catch up on streaming state
+	if isGenerating {
+		sess := h.GetSession(client.sessionID)
+		if sess != nil {
+			streamingState := sess.GetStreamingState()
+			if len(streamingState.ActiveContentBlocks) > 0 {
+				log.Printf("[%s] Sending %d active content blocks to reconnecting client", client.sessionID, len(streamingState.ActiveContentBlocks))
+				for _, block := range streamingState.ActiveContentBlocks {
+					select {
+					case client.send <- block:
+					default:
+						log.Printf("[%s] Failed to send content block - client buffer full", client.sessionID)
+					}
+				}
+			}
 		}
 	}
 }
